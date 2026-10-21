@@ -35,6 +35,7 @@ dependencies = [
     "evaluate",
     "tensorboardx>=2.6.4",
     "redis",
+    "textual[syntax]>=8.2.8",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,7 @@ homepage = "https://pylingual.io"
 
 [project.scripts]
 pylingual = "pylingual.main:main"
+patch = "pylingual.patcher.main:main"
 
 [build-system]
 requires = ["hatchling"]
