@@ -105,6 +105,7 @@ def rendered_text(renderable) -> str:
 def run_app(state, script):
     import asyncio
 
+    pytest.importorskip("textual")
     from pylingual.patcher.tui import PatcherApp
 
     async def main():

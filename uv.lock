@@ -1947,7 +1947,6 @@ dependencies = [
     { name = "rich" },
     { name = "seqeval" },
     { name = "tensorboardx" },
-    { name = "textual", extra = ["syntax"] },
     { name = "tokenizers" },
     { name = "torch" },
     { name = "tqdm" },
@@ -1956,6 +1955,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+patcher = [
+    { name = "textual", extra = ["syntax"] },
+]
 test = [
     { name = "pytest" },
 ]
@@ -1977,7 +1979,7 @@ requires-dist = [
     { name = "rich" },
     { name = "seqeval" },
     { name = "tensorboardx", specifier = ">=2.6.4" },
-    { name = "textual", extras = ["syntax"], specifier = ">=8.2.8" },
+    { name = "textual", extras = ["syntax"], marker = "extra == 'patcher'", specifier = ">=8.2.8" },
     { name = "tokenizers" },
     { name = "torch" },
     { name = "tqdm" },
@@ -1985,7 +1987,7 @@ requires-dist = [
     { name = "transformers", extras = ["torch"] },
     { name = "xdis", git = "https://github.com/rocky/python-xdis" },
 ]
-provides-extras = ["test"]
+provides-extras = ["test", "patcher"]
 
 [[package]]
 name = "pyparsing"

@@ -16,7 +16,13 @@ def main(decompiled: Path, original_pyc: Path, output: Path | None, version: Pyt
     # imported late so --help does not pay for loading the decompiler
     from pylingual.patcher.analysis import PatchSession
     from pylingual.patcher.state import PatchState
-    from pylingual.patcher.tui import PatcherApp
+
+    try:
+        from pylingual.patcher.tui import PatcherApp
+    except ModuleNotFoundError as e:
+        if e.name != "textual":
+            raise
+        raise click.ClickException("the patcher's dependencies are not installed, install them with `uv sync --extra patcher`") from None
 
     click.echo(f"Checking {decompiled} against {original_pyc}...")
     session = PatchSession(original_pyc, version)
