@@ -7,6 +7,10 @@ from pathlib import Path
 from pylingual.patcher.analysis import PatchSession
 
 
+class PatchLocked(Exception):
+    """Raised when a patch is submitted after the source already compiles to the original bytecode"""
+
+
 class PatchState:
     """The decompiled source being patched and every version of it that has been checked"""
 
@@ -19,8 +23,15 @@ class PatchState:
         self.lock = threading.Lock()
         self.check(self.initial_source)
 
+    @property
+    def solved(self) -> dict | None:
+        """The first patch that compiles to the original bytecode, after which no more patches are accepted"""
+        return next((patch for patch in self.patches if patch["successful"]), None)
+
     def check(self, source: str) -> dict:
         with self.lock:
+            if self.solved:
+                raise PatchLocked(f"patch {self.solved['id']} already matches the original bytecode")
             analysis = self.session.analyze(source)
             patch = {
                 "id": len(self.patches),
@@ -38,5 +49,7 @@ class PatchState:
 
     def save(self, source: str) -> Path:
         with self.lock:
+            if self.solved:
+                source = self.solved["source"]
             self.output_path.write_text(source, encoding="utf-8")
         return self.output_path

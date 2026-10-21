@@ -18,7 +18,7 @@ from textual.widgets.option_list import Option
 from textual.color import Color
 from textual.widgets.text_area import Edit, EditResult, TextAreaTheme
 
-from pylingual.patcher.state import PatchState
+from pylingual.patcher.state import PatchLocked, PatchState
 
 # wording for the error kinds reported by the analysis, matching pylingual.io
 KIND_TEXT = {
@@ -193,6 +193,7 @@ class PatcherApp(App):
         self.apply_theme()
         self.sub_title = f"{self.state.session.original_path.name} · Python {self.patch['analysis']['python_version']}"
         self.show_patch(self.patch, replace_source=False)
+        self.lock_if_solved()
         self.query_one(SourceArea).focus()
 
     @property
@@ -360,8 +361,19 @@ class PatcherApp(App):
             return
         self.show_patch(self.state.patches[int(event.option_id[1:])])
 
+    def lock_if_solved(self):
+        """Once a patch matches the original bytecode the source is final, so editing and checking stop"""
+        if self.state.solved:
+            self.editor.read_only = True
+            self.refresh_bindings()
+
+    def check_action(self, action: str, parameters: tuple) -> bool | None:
+        if action == "check" and self.state.solved:
+            return None
+        return True
+
     def action_check(self):
-        if self.checking:
+        if self.checking or self.state.solved:
             return
         self.checking = True
         self.update_summary()
@@ -369,14 +381,18 @@ class PatcherApp(App):
 
     @work(thread=True, exclusive=True)
     def run_check(self, source: str):
-        patch = self.state.check(source)
+        try:
+            patch = self.state.check(source)
+        except PatchLocked:
+            patch = self.state.solved
         self.call_from_thread(self.check_done, patch, source)
 
     def check_done(self, patch: dict, source: str):
         self.checking = False
-        # keep anything typed while the check ran, the results still describe the checked source
-        self.show_patch(patch, replace_source=False)
-        if self.editor.text != source:
+        # keep anything typed while the check ran, the results still describe the checked source, unless the patch is final
+        self.show_patch(patch, replace_source=patch["successful"])
+        self.lock_if_solved()
+        if self.editor.text != source and not patch["successful"]:
             self.editor.set_results(LineTracker(), {})
             self.notify("The source changed during the check, check again to refresh the results.", severity="warning")
         equivalence = patch["analysis"]["equivalence"]

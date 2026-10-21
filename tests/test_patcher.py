@@ -4,7 +4,7 @@ import py_compile
 import pytest
 
 from pylingual.patcher.analysis import PatchSession
-from pylingual.patcher.state import PatchState
+from pylingual.patcher.state import PatchLocked, PatchState
 
 ORIGINAL = """import os
 
@@ -94,6 +94,20 @@ def test_state_keeps_history_and_saves(session, tmp_path):
     assert decompiled.read_text() == WRONG_COMPARE
 
 
+def test_no_patches_after_a_match(session, tmp_path):
+    decompiled = tmp_path / "decompiled.py"
+    decompiled.write_text(WRONG_COMPARE)
+    state = PatchState(session, decompiled, decompiled)
+    assert state.solved is None
+    state.check(ORIGINAL)
+    assert state.solved["id"] == 1
+    with pytest.raises(PatchLocked):
+        state.check(WRONG_COMPARE)
+    # saving always writes the matching source
+    state.save(WRONG_COMPARE)
+    assert decompiled.read_text() == ORIGINAL
+
+
 def rendered_text(renderable) -> str:
     from rich.console import Console
 
@@ -139,6 +153,12 @@ def test_tui_tracks_errors_through_edits_and_checks(session, tmp_path):
             await pilot.pause(0.05)
         assert app.patch["successful"] and app.editor.error_rows() == {}
         assert [p["id"] for p in app.state.patch_list()] == [0, 1]
+
+        # a matching patch is final
+        assert app.editor.read_only
+        await pilot.press("ctrl+r")
+        await pilot.pause()
+        assert not app.checking and len(app.state.patches) == 2
 
     run_app(PatchState(session, decompiled, decompiled), script)
 
