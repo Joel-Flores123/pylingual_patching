@@ -159,3 +159,30 @@ def test_tui_asks_before_quitting_with_unsaved_changes(session, tmp_path):
         assert not app.is_running
 
     run_app(PatchState(session, decompiled, decompiled), script)
+
+
+def test_tui_theme_and_wide_view_cover_both_panels(session, tmp_path):
+    decompiled = tmp_path / "decompiled.py"
+    decompiled.write_text(WRONG_COMPARE)
+
+    async def script(app, pilot):
+        app.theme = "catppuccin-latte"
+        await pilot.pause()
+        assert app.editor.theme == "css-light"
+        app.theme = "monokai"
+        await pilot.pause()
+        assert app.editor.theme == "monokai"
+
+        await pilot.press("ctrl+w")
+        assert app.screen.maximized is app.editor
+        # the line diff brings the side panel back
+        await pilot.press("ctrl+l")
+        assert app.screen.maximized is None and app.query_one("#side").active == "line"
+
+        app.query_one("#messages").focus()
+        await pilot.press("ctrl+w")
+        assert app.screen.maximized is app.query_one("#side")
+        await pilot.press("ctrl+w")
+        assert app.screen.maximized is None
+
+    run_app(PatchState(session, decompiled, decompiled), script)

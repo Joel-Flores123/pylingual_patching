@@ -3,7 +3,6 @@ from __future__ import annotations
 import difflib
 import re
 
-from rich.color import Color, blend_rgb
 from rich.console import Group
 from rich.segment import Segment
 from rich.style import Style
@@ -16,7 +15,8 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.strip import Strip
 from textual.widgets import DataTable, Footer, Header, OptionList, Static, TabbedContent, TabPane, TextArea
 from textual.widgets.option_list import Option
-from textual.widgets.text_area import Edit, EditResult
+from textual.color import Color
+from textual.widgets.text_area import Edit, EditResult, TextAreaTheme
 
 from pylingual.patcher.state import PatchState
 
@@ -39,11 +39,9 @@ KIND_COLOR = {
     "missing_bytecode": "#2d8fb3",
     "extra_bytecode": "#8a6d3b",
 }
-# rich has no transparency, so error tints are blended into the editor background ahead of time
-EDITOR_BACKGROUND = Color.parse("#272822").get_truecolor()
-LINE_TINT = {kind: Style(bgcolor=Color.from_triplet(blend_rgb(EDITOR_BACKGROUND, Color.parse(color).get_truecolor(), 0.3))) for kind, color in KIND_COLOR.items()}
-REMOVED = Style(color="#f07272", bgcolor="#3a1d1f")
-ADDED = Style(color="#4cc287", bgcolor="#173226")
+# app themes that have a matching editor theme, the rest use the app's colors with a dark or light syntax palette
+EDITOR_THEMES = {"monokai", "dracula"}
+LIGHT_EDITOR_THEME = TextAreaTheme(name="css-light", syntax_styles=TextAreaTheme.get_builtin_theme("github_light").syntax_styles)
 offset_regex = re.compile(r"^\d+ ", re.MULTILINE)
 
 
@@ -51,7 +49,7 @@ def strip_offsets(text: str) -> str:
     return offset_regex.sub("", text)
 
 
-def diff_table(original: str, reconstructed: str) -> Table:
+def diff_table(original: str, reconstructed: str, removed: Style, added: Style) -> Table:
     """Two column diff of bytecode listings, aligned while ignoring instruction offsets"""
     a, b = original.splitlines(), reconstructed.splitlines()
     table = Table(expand=True, show_edge=False, pad_edge=False, box=None)
@@ -65,7 +63,7 @@ def diff_table(original: str, reconstructed: str) -> Table:
             if tag == "equal":
                 table.add_row(left, right)
             else:
-                table.add_row(Text(left, REMOVED if left else ""), Text(right, ADDED if right else ""))
+                table.add_row(Text(left, removed if left else ""), Text(right, added if right else ""))
     return table
 
 
@@ -118,6 +116,11 @@ class SourceArea(TextArea):
         self._line_cache.clear()
         return result
 
+    def line_tint(self, kind: str) -> Style:
+        # rich has no transparency, so the tint is blended into the current background
+        background = self.background_colors[1]
+        return Style(bgcolor=background.blend(Color.parse(KIND_COLOR[kind]), 0.3).rich_color)
+
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
         kind = self.error_rows().get(self.scroll_offset.y + y)
@@ -125,11 +128,16 @@ class SourceArea(TextArea):
             return strip
         # replace the theme background but leave the cursor alone so it stays visible
         cursor = self._theme.cursor_style if self._theme else None
-        tint = LINE_TINT[kind]
+        tint = self.line_tint(kind)
         return Strip([segment if cursor and segment.style == cursor else Segment(segment.text, (segment.style or Style()) + tint, segment.control) for segment in strip], strip.cell_length)
 
 
+class SidePanel(TabbedContent):
+    ALLOW_MAXIMIZE = True
+
+
 class PatcherApp(App):
+    ALLOW_IN_MAXIMIZED_VIEW = "Header, Footer"
     TITLE = "PyLingual Patcher"
     CSS = """
     #summary { height: 1; padding: 0 1; text-style: bold; }
@@ -138,6 +146,7 @@ class PatcherApp(App):
     #body { height: 1fr; }
     #source { width: 3fr; }
     #side { width: 2fr; min-width: 40; }
+    .-maximized { height: 1fr; }
     #line-info { padding: 0 1; }
     #bytecode { height: 1fr; }
     """
@@ -149,7 +158,7 @@ class PatcherApp(App):
         Binding("ctrl+b", "previous_error", "Prev error", priority=True),
         Binding("ctrl+l", "show_tab('line')", "Line diff", priority=True),
         Binding("ctrl+e", "focus_editor", "Editor", priority=True),
-        Binding("ctrl+w", "toggle_wide", "Wide panel", priority=True),
+        Binding("ctrl+w", "toggle_wide", "Wide view", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
     ]
 
@@ -165,8 +174,8 @@ class PatcherApp(App):
         yield Header()
         yield Static(id="summary")
         with Horizontal(id="body"):
-            yield SourceArea(self.patch["source"], language="python", id="source", soft_wrap=False, show_line_numbers=True, tab_behavior="indent", theme="monokai")
-            with TabbedContent(id="side", initial="report"):
+            yield SourceArea(self.patch["source"], language="python", id="source", soft_wrap=False, show_line_numbers=True, tab_behavior="indent")
+            with SidePanel(id="side", initial="report"):
                 with TabPane("Report", id="report"):
                     yield OptionList(id="messages")
                 with TabPane("Line", id="line"):
@@ -179,6 +188,9 @@ class PatcherApp(App):
         yield Footer()
 
     def on_mount(self):
+        self.editor.register_theme(LIGHT_EDITOR_THEME)
+        self.theme_changed_signal.subscribe(self, lambda _: self.apply_theme())
+        self.apply_theme()
         self.sub_title = f"{self.state.session.original_path.name} · Python {self.patch['analysis']['python_version']}"
         self.show_patch(self.patch, replace_source=False)
         self.query_one(SourceArea).focus()
@@ -190,6 +202,17 @@ class PatcherApp(App):
     @property
     def dirty(self) -> bool:
         return self.editor.text != self.patch["source"]
+
+    def apply_theme(self):
+        theme = self.current_theme
+        self.editor.theme = theme.name if theme.name in EDITOR_THEMES else ("css" if theme.dark else LIGHT_EDITOR_THEME.name)
+        background = Color.parse(theme.background or ("#000000" if theme.dark else "#ffffff"))
+        error, success = Color.parse(theme.error), Color.parse(theme.success)
+        self.removed = Style(color=error.rich_color, bgcolor=background.blend(error, 0.2).rich_color)
+        self.added = Style(color=success.rich_color, bgcolor=background.blend(success, 0.2).rich_color)
+        self.fill_messages()
+        self.fill_bytecode_table()
+        self.update_line_info()
 
     def show_patch(self, patch: dict, replace_source: bool = True):
         self.patch = patch
@@ -207,12 +230,7 @@ class PatcherApp(App):
         self.editor.set_results(LineTracker(lines), errors)
 
         self.update_summary()
-        messages = self.query_one("#messages", OptionList)
-        messages.clear_options()
-        for i, message in enumerate(analysis["equivalence"]["messages"]):
-            style = "" if message["successful"] else "bold #f07272"
-            messages.add_option(Option(Text(message["text"], style=style), id=f"m{i}"))
-
+        self.fill_messages()
         self.fill_bytecode_table()
 
         history = self.query_one("#history", OptionList)
@@ -223,6 +241,13 @@ class PatcherApp(App):
             current = " (shown)" if entry["id"] == patch["id"] else ""
             history.add_option(Option(f"{name} · {entry['date'][11:]} · {mark} {entry['summary']}{current}", id=f"p{entry['id']}"))
         self.update_line_info()
+
+    def fill_messages(self):
+        messages = self.query_one("#messages", OptionList)
+        messages.clear_options()
+        for i, message in enumerate(self.patch["analysis"]["equivalence"]["messages"]):
+            style = "" if message["successful"] else Style(color=self.removed.color, bold=True)
+            messages.add_option(Option(Text(message["text"], style=style), id=f"m{i}"))
 
     def fill_bytecode_table(self):
         analysis = self.patch["analysis"]
@@ -241,14 +266,28 @@ class PatcherApp(App):
             right = rows_b[i] if i < len(rows_b) else ""
             label = original["labels"][i] if i < len(original["labels"]) and original["labels"][i] else (reconstructed["labels"][i] if i < len(reconstructed["labels"]) else "")
             differs = strip_offsets(left) != strip_offsets(right)
-            table.add_row(Text(label, style="dim"), Text(left, REMOVED if differs and left else ""), Text(right, ADDED if differs and right else ""), key=str(i))
+            table.add_row(Text(label, style="dim"), Text(left, self.removed if differs and left else ""), Text(right, self.added if differs and right else ""), key=str(i))
 
     def on_resize(self):
         self.call_after_refresh(self.fill_bytecode_table)
 
     def action_toggle_wide(self):
-        self.editor.display = not self.editor.display
+        """Fill the screen with the focused panel, or put both panels back"""
+        if self.screen.maximized is not None:
+            self.screen.minimize()
+        else:
+            self.screen.maximize(self.focused or self.query_one(SidePanel))
         self.call_after_refresh(self.fill_bytecode_table)
+
+    def show_editor(self):
+        if self.screen.maximized not in (None, self.editor):
+            self.screen.minimize()
+            self.call_after_refresh(self.fill_bytecode_table)
+
+    def show_side(self):
+        if self.screen.maximized is self.editor:
+            self.screen.minimize()
+            self.call_after_refresh(self.fill_bytecode_table)
 
     def update_summary(self):
         equivalence = self.patch["analysis"]["equivalence"]
@@ -276,7 +315,7 @@ class PatcherApp(App):
             parts.append(Text(KIND_TEXT.get(kind, KIND_TEXT["general"]), style=f"bold {KIND_COLOR[kind]}"))
         diff = analysis["line_diffs"].get(line) if line is not None else None
         if diff:
-            parts.append(diff_table(diff[0], diff[1]))
+            parts.append(diff_table(diff[0], diff[1], self.removed, self.added))
         elif analysis["compile_error"]:
             parts.append(Text(analysis["compile_error"]))
         self.query_one("#line-info", Static).update(Group(*parts))
@@ -293,7 +332,7 @@ class PatcherApp(App):
     def jump_to(self, line: int):
         row = min(self.editor.tracker.row(line), self.editor.document.line_count - 1)
         self.editor.cursor_location = (row, 0)
-        self.editor.display = True
+        self.show_editor()
         self.editor.scroll_cursor_visible(center=True)
         self.editor.focus()
         self.update_line_info()
@@ -378,16 +417,17 @@ class PatcherApp(App):
 
     def goto_row(self, row: int):
         self.editor.cursor_location = (row, 0)
-        self.editor.display = True
+        self.show_editor()
         self.editor.scroll_cursor_visible(center=True)
         self.editor.focus()
         self.query_one(TabbedContent).active = "line"
 
     def action_show_tab(self, tab: str):
+        self.show_side()
         self.query_one(TabbedContent).active = tab
 
     def action_focus_editor(self):
-        self.editor.display = True
+        self.show_editor()
         self.editor.focus()
 
     async def action_quit(self):
