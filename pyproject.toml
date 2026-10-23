@@ -40,6 +40,7 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest"]
 patcher = ["textual[syntax]>=8.2.8"]
+mcp = ["mcp>=2.3.0"]
 
 [project.urls]
 homepage = "https://pylingual.io"
@@ -47,6 +48,7 @@ homepage = "https://pylingual.io"
 [project.scripts]
 pylingual = "pylingual.main:main"
 patch = "pylingual.patcher.main:main"
+patch-mcp = "pylingual.patcher.mcp_server:main"
 
 [build-system]
 requires = ["hatchling"]
