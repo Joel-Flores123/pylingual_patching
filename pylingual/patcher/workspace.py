@@ -2,13 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pylingual.patcher.analysis import PatchSession
+from pylingual.patcher.analysis import PatchSession, statement_spans
 from pylingual.patcher.state import PatchLocked, PatchState
 from pylingual.utils.version import PythonVersion
 
 # keeps reports small enough for models with short context windows
 MAX_ERROR_LINES = 20
 MAX_DIFF_LINES = 60
+MAX_STATEMENT_LINES = 10
 
 
 class EditError(Exception):
@@ -83,14 +84,21 @@ class Workspace:
             raise EditError(f"lines {start}-{end} are out of range, the source has {len(lines)} lines")
         return _numbered(lines[start - 1 : end], start)
 
+    def statement(self, line: int) -> str:
+        """The numbered lines of the statement containing line"""
+        if not 0 < line <= len(self.lines):
+            return f"line {line}: (out of range)"
+        start, end = statement_spans(self.source).get(line, (line, line))
+        return _numbered(self.lines[start - 1 : min(end, start + MAX_STATEMENT_LINES - 1)], start) + ("\n  ..." if end - start >= MAX_STATEMENT_LINES else "")
+
     def line_diff(self, line: int) -> str:
         analysis = self.current["analysis"]
         diff = analysis["line_diffs"].get(line)
-        header = f"line {line}: {self.lines[line - 1].strip() if 0 < line <= len(self.lines) else '(out of range)'}"
+        header = self.statement(line)
         if diff is None:
             if analysis["compile_error"]:
                 return f"{header}\nno bytecode, the source does not compile:\n{analysis['compile_error']}"
-            return f"{header}\nno instructions are attributed to this line"
+            return f"{header}\nno instructions are attributed to this statement"
         original, reconstructed = diff
         return f"{header}\n\n== original bytecode ==\n{_clip(original)}\n\n== bytecode of your source ==\n{_clip(reconstructed)}"
 
@@ -130,16 +138,19 @@ class Workspace:
         out += ["", f"{len(failed)} of {len(messages)} code objects differ from the original:"]
         out += [f"  {m['text'].lstrip('*')}" + (f" (line {m['line']})" if m["line"] > 0 else "") for m in failed]
 
-        errors = sorted({(start, kind) for start, _, kind in analysis["line_errors"]})
+        errors = sorted({(start, end, kind) for start, end, kind in analysis["line_errors"]})
         if errors:
-            out += ["", "lines whose bytecode differs:"]
-            for line, kind in errors[:MAX_ERROR_LINES]:
-                text = self.lines[line - 1].rstrip() if 0 < line <= len(self.lines) else ""
-                out.append(f"  {line:>5} [{kind}] {text}")
+            out += ["", "statements whose bytecode differs:"]
+            for start, end, kind in errors[:MAX_ERROR_LINES]:
+                text = self.lines[start - 1].rstrip() if 0 < start <= len(self.lines) else ""
+                span = f"{start}-{end}" if end > start else str(start)
+                out.append(f"  {span:>9} [{kind}] {text}")
             if len(errors) > MAX_ERROR_LINES:
                 out.append(f"  ... and {len(errors) - MAX_ERROR_LINES} more")
             # the first difference usually explains the rest, so show it without another round trip
             out += ["", self.line_diff(errors[0][0])]
+        if any(kind == "missing_bytecode" for _, _, kind in errors):
+            out += ["", "missing_bytecode: the original has whole statements after that one which your source does not produce; the diff shows their instructions."]
         if any("Missing bytecode" in m["text"] for m in failed):
             out += ["", "missing code objects exist in the original but not in your source; use original_bytecode(name) to see what they should contain."]
         return "\n".join(out)

@@ -3,7 +3,7 @@ import py_compile
 
 import pytest
 
-from pylingual.patcher.analysis import PatchSession
+from pylingual.patcher.analysis import PatchSession, statement_spans
 from pylingual.patcher.state import PatchLocked, PatchState
 
 ORIGINAL = """import os
@@ -22,13 +22,37 @@ class C:
 WRONG_COMPARE = ORIGINAL.replace("x > 1", "x >= 1")
 
 
-@pytest.fixture
-def session(tmp_path):
+MULTILINE = """def f(x, y):
+    total = max(
+        x,
+        y,
+    )
+    print(total, x)
+    return total
+
+class C:
+    pass
+"""
+
+
+def compile_session(tmp_path, source: str) -> PatchSession:
     src = tmp_path / "original.py"
-    src.write_text(ORIGINAL)
+    src.write_text(source)
     pyc = tmp_path / "original.pyc"
     py_compile.compile(str(src), cfile=str(pyc), doraise=True)
-    session = PatchSession(pyc)
+    return PatchSession(pyc)
+
+
+@pytest.fixture
+def session(tmp_path):
+    session = compile_session(tmp_path, ORIGINAL)
+    yield session
+    session.close()
+
+
+@pytest.fixture
+def multiline_session(tmp_path):
+    session = compile_session(tmp_path, MULTILINE)
     yield session
     session.close()
 
@@ -57,6 +81,58 @@ def test_bytecode_panes_line_up(session):
     assert len(original["labels"]) == len(original["text"].split("\n"))
     # the first instruction of a line is labelled with that source line
     assert "4" in reconstructed["labels"] and "6" in reconstructed["labels"]
+
+
+def test_statement_spans():
+    source = """@decorator
+def f(
+    a,
+):
+    if a: return 1
+    x = [
+        a,
+    ]
+    match a:
+        case 1:
+            pass
+    try:
+        pass
+    except (
+        ValueError
+    ):
+        pass
+"""
+    spans = statement_spans(source)
+    # compound statements cover their decorators and header but not their body
+    assert spans[1] == spans[4] == (1, 4)
+    # a body on the header's line belongs to the innermost statement
+    assert spans[5] == (5, 5)
+    assert spans[6] == spans[8] == (6, 8)
+    assert spans[9] == (9, 9) and spans[11] == (11, 11)
+    assert spans[14] == spans[16] == (14, 16)
+    assert statement_spans("def f(:\n") == {}
+
+
+def test_multiline_statement_is_one_diff(multiline_session):
+    analysis = multiline_session.analyze(MULTILINE.replace("        y,", "        y + 1,"))
+    assert analysis["line_errors"] == [[2, 5, "different_bytecode"]]
+    assert all(analysis["line_diffs"][line] == analysis["line_diffs"][2] for line in range(2, 6))
+    original, reconstructed = analysis["line_diffs"][2]
+    assert "STORE_FAST 2 (total)" in original and "BINARY_OP" in reconstructed
+
+
+def test_missing_statement_is_not_blamed_on_the_one_before(multiline_session):
+    analysis = multiline_session.analyze(MULTILINE.split("class C")[0])
+    assert [1, 1, "missing_bytecode"] in analysis["line_errors"]
+    original, reconstructed = analysis["line_diffs"][1]
+    assert "missing after this statement (line 9 of the original)\n" in original
+    assert "LOAD_BUILD_CLASS" in original and "LOAD_BUILD_CLASS" not in reconstructed
+
+
+def test_missing_argument_stays_in_its_statement(multiline_session):
+    analysis = multiline_session.analyze(MULTILINE.replace("print(total, x)", "print(total)"))
+    assert analysis["line_errors"] == [[6, 6, "different_bytecode"]]
+    assert "missing after" not in analysis["line_diffs"][6][0]
 
 
 def test_missing_code_object(session):
@@ -161,6 +237,25 @@ def test_tui_tracks_errors_through_edits_and_checks(session, tmp_path):
         assert not app.checking and len(app.state.patches) == 2
 
     run_app(PatchState(session, decompiled, decompiled), script)
+
+
+def test_tui_highlights_whole_statements(multiline_session, tmp_path):
+    decompiled = tmp_path / "decompiled.py"
+    decompiled.write_text(MULTILINE.replace("        y,", "        y + 1,").replace("print(total, x)", "print(total)"))
+
+    async def script(app, pilot):
+        assert app.editor.error_rows() == {1: "different_bytecode", 2: "different_bytecode", 3: "different_bytecode", 4: "different_bytecode", 5: "different_bytecode"}
+        # navigation stops once per statement
+        await pilot.press("ctrl+n")
+        assert app.editor.cursor_location == (1, 0)
+        await pilot.press("ctrl+n")
+        assert app.editor.cursor_location == (5, 0)
+        # any line of a statement shows its diff
+        app.editor.cursor_location = (3, 0)
+        await pilot.pause()
+        assert "BINARY_OP" in rendered_text(app.query_one("#line-info").content)
+
+    run_app(PatchState(multiline_session, decompiled, decompiled), script)
 
 
 def test_tui_asks_before_quitting_with_unsaved_changes(session, tmp_path):

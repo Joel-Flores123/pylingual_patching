@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import difflib
 import tempfile
 from dataclasses import dataclass, field
@@ -41,34 +42,65 @@ def _line_of_each(bytecode: EditableBytecode) -> list[int | None]:
     return [first if x is None else x for x in lines]
 
 
+def statement_spans(source: str) -> dict[int, tuple[int, int]]:
+    """Map each line to the first and last line of the statement it belongs to; compound statements only cover their header.
+    Empty when the running Python cannot parse the source, so callers fall back to single lines."""
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return {}
+    spans = {}
+    # ast.walk is breadth first, so nested statements come later and claim the lines they share with their parent
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.stmt, ast.excepthandler)):
+            continue
+        start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+        end = node.end_lineno or node.lineno
+        block = getattr(node, "body", None) or [case.pattern for case in getattr(node, "cases", [])]
+        if isinstance(block, list) and block:
+            end = max(node.lineno, block[0].lineno - 1)
+        for line in range(start, end + 1):
+            spans[line] = (start, end)
+    return spans
+
+
 @dataclass
 class LineGroup:
-    """Instructions from one code object that belong to a single line of the patched source"""
+    """Instructions from one code object that belong to a single statement of the patched source"""
 
     line: int | None
     original: list[Inst] = field(default_factory=list)
     reconstructed: list[Inst] = field(default_factory=list)
     differs: bool = False
+    # original line of whole statements the patched source does not produce, placed after the statement in `line`
+    missing: int | None = None
 
 
-def align_code_objects(original: EditableBytecode, reconstructed: EditableBytecode) -> list[LineGroup]:
-    """Group the instructions of a matched pair of code objects by the line of the patched source they belong to"""
+def align_code_objects(original: EditableBytecode, reconstructed: EditableBytecode, statement_of=lambda line: line) -> list[LineGroup]:
+    """Group the instructions of a matched pair of code objects by the statement of the patched source they belong to,
+    with statement_of mapping a line to the first line of its statement"""
     keys_a = [_key(inst) for inst in original]
     keys_b = [_key(inst) for inst in reconstructed]
-    lines_b = _line_of_each(reconstructed)
+    lines_b = [statement_of(line) if line is not None else None for line in _line_of_each(reconstructed)]
 
     groups: list[LineGroup] = []
 
     def group_for(line: int | None) -> LineGroup:
-        if not groups or groups[-1].line != line:
+        if not groups or groups[-1].line != line or groups[-1].missing is not None:
             groups.append(LineGroup(line))
         return groups[-1]
 
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(a=keys_a, b=keys_b, autojunk=False).get_opcodes():
         differs = tag != "equal"
         if j1 == j2:
-            # original instructions with nothing to pair against belong to the line before them
-            group = group_for(lines_b[j1 - 1] if j1 else (lines_b[0] if lines_b else None))
+            # original instructions with nothing to pair against belong to the statement before them
+            line = lines_b[j1 - 1] if j1 else (lines_b[0] if lines_b else None)
+            if original[i1].starts_line is not None:
+                # they start a line in the original, so whole statements are missing rather than part of this one
+                groups.append(LineGroup(line, missing=original[i1].starts_line))
+                group = groups[-1]
+            else:
+                group = group_for(line)
             group.original.extend(original[i1:i2])
             group.differs = True
             continue
@@ -169,6 +201,13 @@ class PatchSession:
         results = compare_pyc(self.original, compiled)
         # code objects shared with the original carry its line numbers, so build an unshared copy for display
         reconstructed = PatchedPYC(compiled)
+        spans = statement_spans(source)
+
+        def statement_of(line: int) -> int:
+            return spans.get(line, (line, line))[0]
+
+        def end_of(start: int) -> int:
+            return spans.get(start, (start, start))[1]
 
         original_pane, reconstructed_pane = BytecodePane(), BytecodePane()
         line_diffs: dict[int, list[list[str]]] = {}
@@ -188,9 +227,9 @@ class PatchSession:
                 reconstructed_pane.pad_to(len(original_pane.lines))
             elif bc_a is None:
                 reconstructed_pane.add(f"# {name} (not in original)", target=bc_b.codeobj.co_firstlineno)
-                lines = sorted({x for x in _line_of_each(bc_b) if x is not None})
+                lines = sorted({statement_of(x) for x in _line_of_each(bc_b) if x is not None})
                 for line in lines:
-                    line_errors.append([line, line, kind])
+                    line_errors.append([line, end_of(line), kind])
                 error_line = lines[0] if lines else -1
                 reconstructed_pane.add(_dis(list(bc_b)))
                 reconstructed_pane.add("")
@@ -198,23 +237,24 @@ class PatchSession:
             else:
                 original_pane.add(f"# {name}")
                 reconstructed_pane.add(f"# {name}")
-                for group in align_code_objects(bc_a, bc_b):
+                for group in align_code_objects(bc_a, bc_b, statement_of):
                     label = str(group.line) if group.line is not None else ""
                     original_pane.add(_dis(group.original), label, group.line)
                     reconstructed_pane.add(_dis(group.reconstructed), label, group.line)
                     length = max(len(original_pane.lines), len(reconstructed_pane.lines))
                     original_pane.pad_to(length)
                     reconstructed_pane.pad_to(length)
+                    header = f"# {name}" if group.missing is None else f"# {name}: missing after this statement (line {group.missing} of the original)"
                     if group.line is not None:
-                        line_diffs.setdefault(group.line, []).append([f"# {name}\n{_dis(group.original)}", f"# {name}\n{_dis(group.reconstructed)}"])
+                        line_diffs.setdefault(group.line, []).append([f"{header}\n{_dis(group.original)}", f"{header}\n{_dis(group.reconstructed)}"])
                     if result and group.differs and group.line is not None:
-                        line_errors.append([group.line, group.line, kind])
+                        line_errors.append([group.line, end_of(group.line), kind if group.missing is None else "missing_bytecode"])
                         if error_line < 0:
                             error_line = group.line
                 if result and error_line < 0:
                     # the instructions line up but something else differs (exception table, jump targets, ...)
-                    error_line = result.failed_line_number or bc_b.codeobj.co_firstlineno
-                    line_errors.append([error_line, error_line, kind])
+                    error_line = statement_of(result.failed_line_number or bc_b.codeobj.co_firstlineno)
+                    line_errors.append([error_line, end_of(error_line), kind])
                 original_pane.add("")
                 reconstructed_pane.add("")
 
@@ -224,12 +264,18 @@ class PatchSession:
                 messages.append({"text": f"{name}: Success: Equal", "successful": True, "line": -1})
 
         successful = all(r.success for r in results)
+        # every line of a statement shows the statement's diff
+        statement_diffs = {}
+        for start, diffs in line_diffs.items():
+            joined = ["\n\n".join(x[0] for x in diffs), "\n\n".join(x[1] for x in diffs)]
+            for line in range(start, end_of(start) + 1):
+                statement_diffs[line] = joined
         return {
             "python_version": self.version.as_str(),
             "compile_error": None,
             "equivalence": {"successful": successful, "summary": "Semantically Equivalent" if successful else "Semantic Error", "messages": messages},
             "line_errors": line_errors,
-            "line_diffs": {line: ["\n\n".join(x[0] for x in diffs), "\n\n".join(x[1] for x in diffs)] for line, diffs in line_diffs.items()},
+            "line_diffs": statement_diffs,
             "original_bytecode": original_pane.as_dict(),
             "reconstructed_bytecode": reconstructed_pane.as_dict(),
         }

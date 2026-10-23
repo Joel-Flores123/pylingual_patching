@@ -223,12 +223,13 @@ class PatcherApp(App):
             self.editor.load_text(patch["source"])
             self.editor.cursor_location = location
 
-        lines = {line for line, _, _ in analysis["line_errors"]} | set(analysis["line_diffs"])
         errors = {}
         for start, end, kind in analysis["line_errors"]:
             for line in range(start, end + 1):
                 errors.setdefault(line, kind)
-        self.editor.set_results(LineTracker(lines), errors)
+        # error navigation stops once per statement, not on every line of it
+        self.error_starts = {start for start, _, _ in analysis["line_errors"]}
+        self.editor.set_results(LineTracker(set(errors) | set(analysis["line_diffs"])), errors)
 
         self.update_summary()
         self.fill_messages()
@@ -413,7 +414,7 @@ class PatcherApp(App):
         self.notify(f"Saved to {path}")
 
     def error_rows_sorted(self) -> list[int]:
-        return sorted(self.editor.error_rows())
+        return sorted({self.editor.tracker.row(line) for line in self.error_starts})
 
     def action_next_error(self, from_top: bool = False):
         rows = self.error_rows_sorted()
